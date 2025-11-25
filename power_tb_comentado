@@ -1,0 +1,363 @@
+`timescale 1ns / 1ps
+
+module BATCHARGERpowerfixed_64_tb;
+
+   // ============================================================
+   //  PARAMETERS FROM DATASHEET → Used in sanity_check_power
+   // ============================================================
+   localparam real VREFMIN  = 0.45;
+   localparam real VREFMAX  = 0.55;
+   localparam real IBIASMIN = 0.9e-6;
+   localparam real IBIASMAX = 1.1e-6;
+   localparam real VINMIN   = 3.0;
+   localparam real DROPMIN  = 0.2;
+
+   // Accepted difference between expected and actual current
+   parameter tolerance = 1.0e-3; 
+
+   // ============================================================
+   //  DUT SIGNALS (analog signals are 64-bit IEEE754 encoded)
+   // ============================================================
+   wire [63:0] iforcedbat;
+   wire [63:0] vbatcurr;
+   wire [63:0] vsensbat;
+   wire [63:0] vref;
+   wire [63:0] vin;
+   wire [63:0] ibias1u;
+
+   // Mode/parameter inputs
+   reg  [7:0]  icc, itc, vcv;
+   reg         cc, tc, cv;
+   reg         en;
+   reg  [3:0]  sel;
+
+   // Supply pins (also 64-bit)
+   wire [63:0] dvdd, dgnd, avdd, agnd, pgnd;
+
+   // Real mirrors (for TB calculations)
+   real rl_avdd, rl_dvdd, rl_agnd, rl_dgnd, rl_pgnd;
+   real R, rl_vbatcurr, rl_vref, rl_iforcedbat;
+   real rl_vsensbat, rl_vin, rl_ibias1u;
+   real rl_icc, rl_itc, rl_vcv;
+   real expected_current, Vtarget;
+   reg  supply_ok;
+
+   // ============================================================
+   //  DUT INSTANTIATION
+   // ============================================================
+   BATCHARGERpower_64b uut (
+      .iforcedbat(iforcedbat),
+      .vbatcurr  (vbatcurr),
+      .vsensbat  (vsensbat),
+      .vref      (vref),
+      .vin       (vin),
+      .ibias1u   (ibias1u),
+      .icc       (icc),
+      .itc       (itc),
+      .vcv       (vcv),
+      .cc        (cc),
+      .tc        (tc),
+      .cv        (cv),
+      .en        (en),
+      .sel       (sel),
+      .avdd      (avdd),
+      .dvdd      (dvdd),
+      .dgnd      (dgnd),
+      .agnd      (agnd),
+      .pgnd      (pgnd)
+   ); 
+
+
+   // ============================================================
+   //  TEST SEQUENCE
+   // ============================================================
+   initial begin
+    
+      $display("---Sanity Checks---");
+    
+      // The following tests validate each SANITY condition independently.
+      // (VREF min/max, IBIAS min/max, VIN min, dropout condition, EN=0, etc.)
+
+      //------------------------------------------------------------
+      // 1) VREF too LOW
+      //------------------------------------------------------------
+      en = 1;
+      tc = 0; cc = 0; cv = 0;
+
+      rl_vin      = 5.0;
+      rl_vsensbat = 3.7;
+      rl_vref     = 0.40;    // < VREFMIN → must disable output
+      rl_ibias1u  = 1.0e-6;
+
+      #10;
+      sanity_check_power("SANITY: VREF too LOW",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+
+      expected_current = 0.0;
+      compare_result("VREF too LOW", expected_current, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // 2) VREF too HIGH
+      //------------------------------------------------------------
+      rl_vref = 0.60; // > VREFMAX
+      #10;
+      sanity_check_power("SANITY: VREF too HIGH",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("VREF too HIGH", 0.0, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // 3) IBIAS too LOW
+      //------------------------------------------------------------
+      rl_vref     = 0.50; 
+      rl_ibias1u  = 0.5e-6; // < IBIASMIN
+      #10;
+      sanity_check_power("SANITY: IBIAS too LOW",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("IBIAS too LOW", 0.0, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // 4) IBIAS too HIGH
+      //------------------------------------------------------------
+      rl_ibias1u  = 2.0e-6; // > IBIASMAX
+      #10;
+      sanity_check_power("SANITY: IBIAS too HIGH",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("IBIAS too HIGH", 0.0, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // 5) VIN below VINMIN
+      //------------------------------------------------------------
+      rl_ibias1u  = 1.0e-6;
+      rl_vin      = 2.5; // < 3.0
+      #10;
+      sanity_check_power("SANITY: VIN below VINMIN",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("VIN below VINMIN", 0.0, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // 6) DROPOUT condition tests
+      //------------------------------------------------------------
+      rl_vin      = 3.8;
+      rl_vsensbat = 3.7; // OK → dropout satisfied
+      #10;
+      sanity_check_power("SANITY: DROPOUT OK (reference)",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("DROPOUT OK (reference)", 0.0, rl_iforcedbat);
+
+      // Now force dropout violation
+      rl_vin      = 3.8;
+      rl_vsensbat = 3.7; // Needs ≥3.9 → violation
+      #10;
+      sanity_check_power("SANITY: DROPOUT violated",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("DROPOUT violated", 0.0, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // 7) EN disabled
+      //------------------------------------------------------------
+      rl_vin      = 5.0;
+      rl_vsensbat = 3.7;
+      rl_vref     = 0.50;
+      rl_ibias1u  = 1.0e-6;
+      en          = 0; // disable
+      #10;
+      sanity_check_power("SANITY: EN=0 (disabled)",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+      compare_result("SANITY: EN=0 (disabled)", 0.0, rl_iforcedbat);
+
+      // ------------------------------------------------------------
+      //  MODES TEST (TC, CC, CV)
+      // ------------------------------------------------------------
+      en = 1;
+      sel = 4'b0111;      // C = 400 mA
+      rl_vsensbat = 3.2;
+      rl_vref     = 0.5;
+      rl_vin      = 5.0;
+      rl_ibias1u  = 1.0e-6;
+      icc = 8'b01111111;
+      itc = 8'b00011001;
+      vcv = 8'b10111100;
+
+      $display("---OPERATION MODES---");
+
+      //------------------------------------------------------------
+      // TC mode
+      //------------------------------------------------------------
+      tc = 1; cc = 0; cv = 0;
+      #100;
+      sanity_check_power("Trickle (TC)",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+
+      expected_current = calc_C(sel) *
+          (0.502 * itc[7] + 0.251 * itc[6] + 0.1255 * itc[5] +
+           0.0627*itc[4] + 0.0314*itc[3] + 0.0157*itc[2] +
+           0.0078*itc[1] + 0.0039*itc[0]);
+
+      compare_result("Trickle (TC)", expected_current, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // CC mode
+      //------------------------------------------------------------
+      tc = 0; cc = 1; cv = 0;
+      #100;
+      sanity_check_power("Constant Current (CC)",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+
+      expected_current = calc_C(sel) *
+          (0.502 * icc[7] + 0.251 * icc[6] + 0.1255 * icc[5] +
+           0.0627*icc[4] + 0.0314*icc[3] + 0.0157*icc[2] +
+           0.0078*icc[1] + 0.0039*icc[0]);
+
+      compare_result("Constant Current (CC)", expected_current, rl_iforcedbat);
+
+      //------------------------------------------------------------
+      // CV mode
+      //------------------------------------------------------------
+      tc = 0; cc = 0; cv = 1;
+      #100;
+      sanity_check_power("Constant Voltage (CV)",
+                         rl_vin, rl_vsensbat, rl_vref, rl_ibias1u,
+                         en, tc, cc, cv,
+                         supply_ok);
+
+      R = 0.4 / (0.5 * calc_C(sel));
+      Vtarget = 5.0 *
+         (0.502*vcv[7] + 0.251*vcv[6] + 0.1255*vcv[5] +
+          0.0627*vcv[4] + 0.0314*vcv[3] + 0.0157*vcv[2] +
+          0.0078*vcv[1] + 0.0039*vcv[0]);
+
+      expected_current = (Vtarget - rl_vsensbat) / R;
+      compare_result("Constant Voltage (CV)", expected_current, rl_iforcedbat);
+
+      $display("--- TODOS OS TESTES PASSARAM ---");
+      $finish;
+   end
+
+
+   // ============================================================
+   //  CONVERT REAL → 64 BITS (for DUT)
+   // ============================================================
+   assign vref     = $realtobits(rl_vref);
+   assign vsensbat = $realtobits(rl_vsensbat);
+   assign vin      = $realtobits(rl_vin);
+   assign ibias1u  = $realtobits(rl_ibias1u);
+   assign pgnd     = $realtobits(rl_pgnd);
+   assign avdd     = $realtobits(rl_avdd);
+   assign dvdd     = $realtobits(rl_dvdd);
+   assign agnd     = $realtobits(rl_agnd);
+   assign dgnd     = $realtobits(rl_dgnd);
+
+   // Read DUT outputs as real
+   initial assign rl_iforcedbat = $bitstoreal(iforcedbat);
+   initial assign rl_vbatcurr   = $bitstoreal(vbatcurr);
+
+
+   // ============================================================
+   //  TASK: sanity_check_power
+   //  → Checks whether the power block is allowed to operate.
+   //  → Validates VREF range, IBIAS range, VIN range, DROPOUT, EN flag.
+   //  → If any condition fails, current MUST be zero.
+   // ============================================================
+   task sanity_check_power;
+      input  [31*8:1] op_name;    // Label for this test
+      input  real rl_vin;
+      input  real rl_vsensbat;
+      input  real rl_vref;
+      input  real rl_ibias1u;
+      input        en, tc, cc, cv;
+      output       supply_ok;
+
+      reg vref_ok, ibias_ok, vin_ok;
+   begin
+      // Check limits defined in datasheet
+      vref_ok  = (rl_vref    >= VREFMIN  && rl_vref    <= VREFMAX);
+      ibias_ok = (rl_ibias1u >= IBIASMIN && rl_ibias1u <= IBIASMAX);
+      vin_ok   = (rl_vin >= VINMIN) && (rl_vin >= rl_vsensbat + DROPMIN);
+
+      // supply_ok determines whether current is allowed
+      supply_ok = (en && vref_ok && ibias_ok && vin_ok);
+
+      if (!vref_ok)
+         $display("SANITY ERROR [%s]: VREF out of range", op_name);
+
+      if (!ibias_ok)
+         $display("SANITY ERROR [%s]: IBIAS out of range", op_name);
+
+      if (!vin_ok)
+         $display("SANITY ERROR [%s]: VIN or DROPOUT invalid", op_name);
+
+      if (!en)
+         $display("SANITY ERROR [%s]: EN=0 (disabled)", op_name);
+
+      // Helpful message: Should current be zero or allowed?
+      if (!supply_ok)
+         $display("supply_ok = 0 → Expected current MUST be 0");
+      else 
+         $display("supply_ok = 1 → Charger can operate normally");
+   end
+   endtask
+
+
+   // ============================================================
+   //  TASK: compare_result
+   //  → Compares expected and actual real current.
+   //  → PASS if |error| < tolerance, FAIL otherwise.
+   // ============================================================
+   task compare_result;
+      input [31*8:1] operation_mode; // Text label
+      input real expected_value;     // TB computed ideal current
+      input real actual_value;       // Measured from DUT
+      real difference;
+   begin
+      difference = fabs(expected_value - actual_value);
+
+      if (difference < tolerance) begin
+         $display("Current Check - TEST PASSED: %s | Expected: %f | Actual: %f | Δ = %f",
+                  operation_mode, expected_value, actual_value, difference);
+      end 
+      else begin
+         $display("CURRENT CHECK - TEST FAILED: %s | Expected: %f | Actual: %f | Δ = %f",
+                  operation_mode, expected_value, actual_value, difference);
+         $finish;
+      end
+   end
+   endtask
+
+
+   // ============================================================
+   //  FUNCTION: calc_C
+   //  → Computes battery capacity C in Amperes based on sel[3:0]
+   // ============================================================
+   function real calc_C(input [3:0] sel);
+      real C;
+      begin
+         C = 50.0e-3; // Base 50 mA
+         if (sel[0]) C = C +  50.0e-3;
+         if (sel[1]) C = C + 100.0e-3;
+         if (sel[2]) C = C + 200.0e-3;
+         if (sel[3]) C = C + 400.0e-3;
+         calc_C = C;
+      end
+   endfunction
+
+endmodule
