@@ -1,0 +1,253 @@
+`timescale 1ns/1ps
+
+module BATCHARGER_64b_tb;
+
+   // -----------------------
+   // Digital control signals
+   // -----------------------
+   reg        clk;
+   reg        rstz;
+   reg        en;
+   reg  [3:0] sel;
+
+   // -----------------------
+   // Analog 64-bit I/O
+   // -----------------------
+   wire [63:0] iforcedbat;
+   wire [63:0] vsensbat;
+   wire [63:0] vin;
+   wire [63:0] vbattemp;
+   wire [63:0] dvdd;
+   wire [63:0] dgnd;
+   wire [63:0] pgnd;
+
+   // -----------------------
+   // Real-valued mirrors
+   // -----------------------
+   real rl_iforcedbat;
+   real rl_vsensbat;
+   real rl_vin;
+   real rl_vbattemp;
+   real rl_dvdd;
+   real rl_dgnd;
+   real rl_pgnd;
+
+   // -----------------------
+   // Expected current variables
+   // -----------------------
+   real expected_current;
+   real Vtarget;
+   real R;
+
+   parameter real tolerance = 1.0e-3;
+
+   // -----------------------
+   // Internal DAC codes from TOP
+   // (read hierarchically from DUT; used in current formulas)
+   // -----------------------
+   wire [7:0] icc = dut.icc;
+   wire [7:0] itc = dut.itc;
+   wire [7:0] vcv = dut.vcv;
+
+   // -----------------------
+   // Real <-> 64-bit mapping
+   // -----------------------
+   assign vsensbat = $realtobits(rl_vsensbat);
+   assign vin      = $realtobits(rl_vin);
+   assign vbattemp = $realtobits(rl_vbattemp);
+   assign dvdd     = $realtobits(rl_dvdd);
+   assign dgnd     = $realtobits(rl_dgnd);
+   assign pgnd     = $realtobits(rl_pgnd);
+
+// ====================================================
+   always @(*) rl_iforcedbat = $bitstoreal(iforcedbat);
+
+   // -----------------------
+   // DUT instantiation (TOP MODULE)
+   // -----------------------
+   BATCHARGER_64b dut (
+      .iforcedbat(iforcedbat),
+      .vsensbat(vsensbat),
+      .vin(vin),
+      .vbattemp(vbattemp),
+      .en(en),
+      .sel(sel),
+      .clk(clk),
+      .rstz(rstz),
+      .dvdd(dvdd),
+      .dgnd(dgnd),
+      .pgnd(pgnd)
+   );
+
+   // -----------------------
+   // Clock generation
+   // -----------------------
+   initial clk = 0;
+   always #5 clk = ~clk;
+
+   // ============================================================
+   // TEST SEQUENCE — ONLY POWER MODE CURRENT MATCH TESTS
+   // ============================================================
+   initial begin
+
+      // Basic supplies
+      rl_dvdd = 1.8;
+      rl_dgnd = 0.0;
+      rl_pgnd = 0.0;
+
+      // Battery & VIN initial conditions
+      rl_vin      = 5.0;
+      rl_vsensbat = 3.2;
+      rl_vbattemp = 0.5;   // any mid-range temperature
+
+      sel  = 4'b0111;  // C = 400 mAh
+      en   = 0;
+      rstz = 0;
+
+      // Release reset and enable
+      #100;
+      en   = 1;
+      rstz = 1;
+
+      #500; // stabilization
+
+      $display("\n\n========== POWER BLOCK CURRENT TESTS (TOP MODULE) ==========");
+      $display("Battery size C = %0.3f A", calc_C(sel));
+
+      // ----------------------------------------------------------
+      // TEST 1 : TRICKLE MODE (TC)
+      // ----------------------------------------------------------
+      $display("\n--- TEST 1: Trickle Mode (TC) ---");
+
+      // Force state machine outputs to TC mode (bypassing controller)
+      force dut.tc = 1;
+      force dut.cc = 0;
+      force dut.cv = 0;
+
+      rl_vsensbat = 3.0; // low Vbat
+
+      #200;
+
+      // Expected trickle current from itc code and capacity C
+      expected_current =
+         calc_C(sel) *
+        (0.502 * itc[7] + 0.251 * itc[6] + 0.1255 * itc[5] + 0.0627 * itc[4] +
+         0.0314 * itc[3] + 0.0157 * itc[2] + 0.0078 * itc[1] + 0.0039 * itc[0]);
+
+      compare_result("Trickle", expected_current, rl_iforcedbat);
+
+      // ----------------------------------------------------------
+      // TEST 2 : CONSTANT CURRENT MODE (CC)
+      // ----------------------------------------------------------
+      $display("\n--- TEST 2: Constant Current Mode (CC) ---");
+
+      force dut.tc = 0;
+      force dut.cc = 1;
+      force dut.cv = 0;
+
+      rl_vsensbat = 3.7;
+
+      #200;
+
+      // Expected CC current from icc code and capacity C
+      expected_current =
+         calc_C(sel) *
+        (0.502 * icc[7] + 0.251 * icc[6] + 0.1255 * icc[5] + 0.0627 * icc[4] +
+         0.0314 * icc[3] + 0.0157 * icc[2] + 0.0078 * icc[1] + 0.0039 * icc[0]);
+
+      compare_result("Constant Current", expected_current, rl_iforcedbat);
+
+      // ----------------------------------------------------------
+      // TEST 3 : CONSTANT VOLTAGE MODE (CV)
+      // ----------------------------------------------------------
+      $display("\n--- TEST 3: Constant Voltage Mode (CV) ---");
+
+      force dut.tc = 0;
+      force dut.cc = 0;
+      force dut.cv = 1;
+
+      // Effective resistor used in CV equation (function of C)
+      R = 0.4 / (0.5 * calc_C(sel));
+
+      // Target voltage Vtarget derived from vcv[7:0] DAC code
+      Vtarget = 5.0 *
+         (0.502 * vcv[7] + 0.251 * vcv[6] + 0.1255 * vcv[5] + 0.0627 * vcv[4] +
+          0.0314 * vcv[3] + 0.0157 * vcv[2] + 0.0078 * vcv[1] + 0.0039 * vcv[0]);
+
+      // --- Case A : below target ---
+      rl_vsensbat = Vtarget - 0.2;
+      #200;
+      expected_current = (Vtarget - rl_vsensbat) / R;
+      compare_result("CV below target", expected_current, rl_iforcedbat);
+
+      // --- Case B : near target ---
+      rl_vsensbat = Vtarget - 0.01;
+      #200;
+      expected_current = (Vtarget - rl_vsensbat) / R;
+      compare_result("CV near target", expected_current, rl_iforcedbat);
+
+      // --- Case C : Vsensbat > Vtarget → current is negative by equation
+      rl_vsensbat = Vtarget + 0.05;
+      #200;
+      expected_current = (Vtarget - rl_vsensbat) / R; 
+      compare_result("CV above target (equation)", expected_current, rl_iforcedbat);
+   
+      // NOTE:
+      // When Vsensbat is above Vtarget, the datasheet gives no special rule.
+      // The CV equation I = (Vtarget - Vsensbat) / R directly produces a
+      // negative current, which mathematically matches the model.
+      // We keep this behavior (no clamping to zero), and we explain in the
+      // report that this corner case was analyzed and the chosen solution
+      // was to follow the raw formula as specified.
+
+      // release forced signals so DUT returns to normal behavior
+      release dut.tc;
+      release dut.cc;
+      release dut.cv;
+
+      $display("\n========== ALL POWER-BLOCK CURRENT TESTS PASSED ==========\n");
+      $finish;
+
+   end
+
+   // ============================================================
+   // Supporting TASKS
+   // ============================================================
+
+   // Generic comparison between expected and measured current
+   task compare_result;
+      input [31*8:1] operation_mode;
+      input real expected_value;
+      input real actual_value;
+
+      real difference;
+   begin
+      difference = (expected_value > actual_value) ?
+                   (expected_value - actual_value) :
+                   (actual_value - expected_value);
+
+      if (difference < tolerance) begin
+         $display("PASS [%s] Expected=%f Actual=%f Δ=%f",
+                  operation_mode, expected_value, actual_value, difference);
+      end else begin
+         $display("FAIL [%s] Expected=%f Actual=%f Δ=%f",
+                  operation_mode, expected_value, actual_value, difference);
+         $finish;
+      end
+   end
+   endtask
+
+   // Compute battery capacity C (in A) from selection bits sel[3:0]
+   function real calc_C(input [3:0] sel);
+      real C;
+      begin
+         C = 50.0e-3;
+         if (sel[0]) C = C +  50.0e-3;
+         if (sel[1]) C = C + 100.0e-3;
+         if (sel[2]) C = C + 200.0e-3;
+         if (sel[3]) C = C + 400.0e-3;
+         calc_C = C;
+      end
+   endfunction
+
+endmodule
